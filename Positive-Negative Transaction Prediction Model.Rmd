@@ -1,0 +1,223 @@
+---
+utitle: "Postive-Negative Transaction Prediction Model"
+author: "Aiken Ong"
+date: "2023-11-16"
+output: html_document
+---
+```{r Libraries}
+library(igraph)
+library(caret)
+library(ggplot2)
+library(lubridate)
+library(dplyr)
+library(pROC)
+library(ROSE)
+library(kernlab)
+library(lattice)
+library(xgboost)
+```
+
+```{r Data Preprocessing}
+# Load your dataset
+data <- read.csv('soc-sign-bitcoinotc.csv', header = FALSE)
+colnames(data) <- c("source", "target", "rating", "time")
+
+# Convert time from epoch to date
+data$time <- as.POSIXct(data$time, origin = "1970-01-01")
+```
+
+```{r Feature Selection/Engineering}
+# Create a graph using igraph
+g <- graph_from_data_frame(data[, c("source", "target")], directed = TRUE)
+
+# Calculate network centrality measures
+node_in_degrees <- degree(g, mode = "in")
+node_out_degrees <- degree(g, mode = "out")
+betweenness_centrality <- betweenness(g)
+close_centrality <- closeness(g)
+
+# Add network attributes to the dataset
+data$source_in_degree <- node_in_degrees[data$source] 
+data$source_out_degree <- node_out_degrees[data$source]
+data$source_betweenness <- betweenness_centrality[data$source]
+data$source_close <- close_centrality[data$source]
+
+data$target_in_degree <- node_in_degrees[data$target]
+data$target_out_degree <- node_out_degrees[data$target]
+data$target_betweenness <- betweenness_centrality[data$target]
+data$target_close <- close_centrality[data$target]
+
+# Variance of in-degree, out-degree and betweenness between source and target nodes
+data$variance_in_degree <- (data$source_in_degree - data$target_in_degree)^2
+data$variance_out_degree <- (data$source_out_degree - data$target_out_degree)^2
+data$variance_betweenness <- (data$source_betweenness - data$target_betweenness)^2
+data$variance_close <- (data$source_close - data$target_close)^2
+
+# List of column names to normalise
+columns_to_normalize <- c("source_in_degree", "source_out_degree", "source_betweenness", "source_close",
+                          "target_in_degree", "target_out_degree", "target_betweenness", "target_close",
+                          "variance_in_degree", "variance_out_degree", "variance_betweenness","variance_close")
+
+# Loop through each column and normalize
+for (column in columns_to_normalize) {
+    data[[column]] <- data[[column]] / max(data[[column]], na.rm = TRUE)
+}
+
+# Create a new rating column with values 0 or 1
+data$rating <- ifelse(data$rating > 0, 1, 0)
+data$rating <- as.factor(data$rating)
+
+# Undersampling
+data <- ovun.sample(rating ~ ., data = data, method = "under", p = 0.5, seed = 5)$data
+```
+
+```{r Splitting Data}
+# Split the data into training and testing sets
+set.seed(42)
+train_index <- createDataPartition(data$rating, p = 0.8, list = FALSE)
+train_data <- data[train_index, ]
+test_data <- data[-train_index, ]
+
+# Define training control
+train_control <- trainControl(
+  method = "cv",       # Cross-validation
+  number = 10          # Number of folds
+)
+```
+
+```{r Model Training}
+set.seed(42)
+# Define and train the model
+
+# List of algos
+algos <- c("lda", "knn", "svmRadial", "rf", "rpart", "xgbTree", "gbm")
+models <- c()
+
+# loop through algos
+for (algo in algos) {
+  
+  fit <- train(rating ~ 
+                      source_in_degree + source_out_degree + source_betweenness + source_close +
+                      target_in_degree + target_out_degree + target_betweenness + target_close +
+                      variance_in_degree + variance_out_degree + variance_betweenness + variance_close, 
+                    data = train_data, 
+                    method = algo,
+                    trControl = train_control)
+  
+  assign(paste0("fit.", algo), fit)
+  # Add the model to the list of models
+  models <- c(models, list(fit))
+}
+```
+
+```{r train and validation loss}
+# Initialize an empty data frame to store performance metrics
+performance_metrics <- data.frame(
+  Model = character(),
+  Accuracy = numeric(),
+  Kappa = numeric(),
+  stringsAsFactors = FALSE
+)
+# print model in models
+# Loop through each model, extract performance metrics, and add them to the data frame
+for (algo in algos) {
+  # Dynamically create the variable name of the model
+  model_name <- paste0("fit.", algo)
+  
+  # Retrieve the model object using get()
+  model <- get(model_name)
+  
+  # Extract the best accuracy and kappa from the model results
+  best_accuracy <- max(model$results$Accuracy)
+  best_kappa <- max(model$results$Kappa)
+  
+  # Combine the current model's metrics into a data frame
+  current_metrics <- data.frame(
+    Model = algo,
+    Accuracy = best_accuracy,
+    Kappa = best_kappa
+  )
+  
+  # Bind the current metrics to the overall performance metrics data frame
+  performance_metrics <- rbind(performance_metrics, current_metrics)
+}
+
+# Print the performance metrics table
+print(performance_metrics)
+
+```
+
+```{r Test}
+# Initialize an empty data frame to store test performance metrics
+test_performance_metrics <- data.frame(
+  Model = character(),
+  Accuracy = numeric(),
+  Precision = numeric(),
+  Recall = numeric(),
+  F1Score = numeric(),
+  AUCROC = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Loop through each model, make predictions on the test set, and calculate performance metrics
+for (algo in algos) {
+  # Retrieve the model object using get()
+  model_name <- paste0("fit.", algo)
+  model <- get(model_name)
+  
+  # Make predictions on the test set
+  predictions <- predict(model, newdata = test_data)
+  
+  # Generate the confusion matrix
+  cm <- confusionMatrix(predictions, test_data$rating)
+  
+  # Calculate AUC-ROC
+  roc <- roc(test_data$rating, as.numeric(predictions))
+  
+  # Add the model's test metrics to the data frame
+  test_performance_metrics <- rbind(test_performance_metrics, data.frame(
+    Model = algo,
+    Accuracy = cm$overall['Accuracy'],
+    Precision = cm$byClass['Pos Pred Value'],
+    Recall = cm$byClass['Sensitivity'],
+    F1Score = 2 * (cm$byClass['Pos Pred Value'] * cm$byClass['Sensitivity']) / (cm$byClass['Pos Pred Value'] + cm$byClass['Sensitivity']),
+    AUCROC = auc(roc),
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Print the test performance metrics table
+print(test_performance_metrics)
+
+# save the test performance metrics table is csv file
+write.csv(test_performance_metrics, "test_performance_metrics.csv", row.names = FALSE)
+
+```
+
+```{r features}
+# Assuming 'classifier' is your trained Random Forest model
+
+# Extract feature importance
+importance <- varImp(fit.xgbTree)$importance
+
+# View the importance scores
+print(importance)
+
+# Convert to a data frame for plotting
+importance_df <- as.data.frame(importance)
+
+importance_df$Feature <- rownames(importance_df)
+
+# Create a plot of feature importance
+# Create a plot of feature importance
+ggplot(importance_df, aes(x = reorder(Feature, Overall), y = Overall)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +  # Flips the axes for better readability
+    xlab("Features") +
+    ylab("Importance") +
+    ggtitle("Feature Importance in eXtreme Gradient Boosting Tree")
+
+# dataset for test and predicted values
+test_data$predicted <- predictions
+
+```
